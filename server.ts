@@ -1,6 +1,10 @@
 import express from "express";
 import path from "path";
 import { GoogleGenAI, Type } from "@google/genai";
+import dotenv from "dotenv";
+
+// Load environment variables early
+dotenv.config();
 
 export const app = express();
 const PORT = 3000;
@@ -63,6 +67,10 @@ function getLanguageInstruction(lang?: string): string {
   }
 }
 
+// Global state tracking for model health to prevent Vercel Serverless timeouts
+let lastModelOverloadTime = 0;
+const OVERLOAD_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes cooldown
+
 // Helper to perform robust generation with fallback to other models and automatic retry on transient errors (e.g. 503 Unavailable)
 async function generateContentWithFallbackAndRetry(
   ai: GoogleGenAI,
@@ -74,11 +82,22 @@ async function generateContentWithFallbackAndRetry(
   maxRetries = 2
 ): Promise<any> {
   const modelsToTry = [params.model];
+  const now = Date.now();
+  const isOverloaded = (now - lastModelOverloadTime) < OVERLOAD_COOLDOWN_MS;
+
   if (params.model === "gemini-3.5-flash") {
-    // Offer multiple alternative flash models to fall back to in sequence if overloaded
-    modelsToTry.push("gemini-flash-latest");
-    modelsToTry.push("gemini-3.1-flash-lite");
-    modelsToTry.push("gemini-3.1-pro-preview");
+    if (isOverloaded) {
+      // Prioritize the highly available lite model first to bypass overloaded nodes and minimize Latency / Vercel timeouts
+      console.log("ℹ️ [Server Model Routing] gemini-3.5-flash has recently experienced high demand (503). Routing directly to gemini-3.1-flash-lite.");
+      modelsToTry.unshift("gemini-3.1-flash-lite");
+      modelsToTry.push("gemini-flash-latest");
+      modelsToTry.push("gemini-3.1-pro-preview");
+    } else {
+      // Default order: standard flash -> backup flash -> lite model -> premium pro fallback
+      modelsToTry.push("gemini-flash-latest");
+      modelsToTry.push("gemini-3.1-flash-lite");
+      modelsToTry.push("gemini-3.1-pro-preview");
+    }
   }
 
   let lastError: any = null;
@@ -107,6 +126,7 @@ async function generateContentWithFallbackAndRetry(
                               err.status === "UNAVAILABLE";
                               
         if (isUnavailable) {
+          lastModelOverloadTime = Date.now();
           console.warn(`[Gemini API] Model ${modelName} is unavailable/overloaded. Switching to next model immediately...`);
           break; // Break the current retry loop to transition to the next model in modelsToTry
         }
